@@ -103,6 +103,25 @@ alternative to the CUDA1-3 caches above, not a third tier beside them.
   the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the
   primary.
 
+The peer computes prompt rows only in chunks of up to 3072 tokens (`STRATA_PF_PEER_MAX`; 0 = every chunk). Its
+buffers are sized for that chunk, so they fit in the default `--peer-reserve-mib 600`; sized for the whole
+`--prefill` chunk they did not, and the peer then took no prompt rows at all. A bigger chunk routes nearly every
+expert, and the primary alone streaming what it lacks is faster than waiting for the peer's rows. Measured on 2x
+V100-PCIE-32GB (no NVLink), UD-IQ4_XS, `--prefill auto:16384`, text appended to a cached chat (`--peer-prefill-rows 0`
+for the primary alone):
+
+| appended tokens | primary alone | with the peer |
+|---|---|---|
+| 100 | 1.52 s | 0.87 s |
+| 550 | 2.49 s | 1.35 s |
+| 1,350 | 3.51 s | 2.32 s |
+| 2,050 | 3.63 s | 2.98 s |
+| 2,950 | 3.99 s | 3.95 s |
+| 3,770 (above the cap) | 4.74 s | 4.73 s |
+
+A 28,650-token prompt read in 32.0 / 31.9 s, decode 56 / 57 tok/s, and the greedy reply to a 534-token append was
+byte-identical.
+
 `--peer-device` requires `--expert-profile` and an enabled expert cache, and
 the device must be visible; it refuses otherwise. It also refuses
 `--layer-split` (a different second-GPU mode: use one or the other) and

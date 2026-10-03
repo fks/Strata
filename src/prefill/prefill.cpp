@@ -104,6 +104,22 @@ inline int64_t stream_all_min() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1024; }();
     return v;
 }
+// --peer-device: the largest prompt chunk the peer computes its experts' rows of.  A small chunk routes only part of
+// each layer's experts, and copying the experts the primary lacks costs more than the peer's work on the ones it holds
+// (and only the activations cross the link); a big chunk routes nearly all of them, the peer's MMQ products become the
+// critical path and the primary waits for them.  Measured on 2x V100-PCIE-32GB (no NVLink), UD-IQ4_XS,
+// --prefill auto:16384, appends to a cached chat, primary alone / with the peer: 100 tokens 1.52 / 0.87 s, 550 2.49 /
+// 1.35, 1,350 3.51 / 2.32, 2,050 3.63 / 2.98, 2,300 3.64 / 3.25, 2,950 3.99 / 3.95.  The buffers for 3072 tokens fit
+// in the default --peer-reserve-mib 600; a 16384-token chunk's did not, and the peer then took no prompt rows at all.
+// STRATA_PF_PEER_MAX overrides (0 = the peer for every chunk; its buffers then take ~1 GB more on the peer).
+inline int64_t peer_max_chunk() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_PEER_MAX");
+        const int64_t n = e ? (int64_t) std::atoll(e) : (int64_t) 3072;
+        return n > 0 ? n : (int64_t) 1 << 40;
+    }();
+    return v;
+}
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -344,7 +360,10 @@ struct Stager {
 struct PeerPrefill {
     core::PeerExperts* peer = nullptr;
     int dev = -1;
-    int64_t cap_rows = 0, T_max = 0;
+    int64_t cap_rows = 0;
+    // the largest chunk the peer computes rows of (its buffers are sized for it); a bigger chunk runs on the primary
+    // alone, streaming every expert it lacks - see peer_max_chunk()
+    int64_t T_max = 0;
     cudaStream_t s = nullptr;
     cudaEvent_t ev_in = nullptr;    // on the primary: the activations and the row tables are ready
     cudaEvent_t ev_done = nullptr;  // on the peer: its rows have landed in the primary's Dm
@@ -1058,8 +1077,8 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    pp->T_max = m.T_max;
-    pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, m.T_max * K));
+    pp->T_max = std::min<int64_t>(m.T_max, peer_max_chunk());
+    pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, pp->T_max * K));
     const int64_t R = pp->cap_rows;
     const MmqPlan& mp = mmq_plan();
     if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
@@ -1084,14 +1103,14 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->owned.push_back(p);
         return p;
     };
-    pp->mixed = (float*) take((size_t) m.T_max * N * 4);
+    pp->mixed = (float*) take((size_t) pp->T_max * N * 4);
     {
         const char* v = std::getenv("STRATA_PF_PEER_COMPACT");
         pp->compact = v == nullptr || std::atoi(v) != 0;
     }
     if (pp->compact) {
-        pp->cap_rows = m.T_max * K;   // no row cap: only the row tables grow with it
-        pp->G = m.T_max;              // one expert never has more rows than the chunk has tokens
+        pp->cap_rows = pp->T_max * K;   // no row cap: only the row tables grow with it
+        pp->G = pp->T_max;              // one expert never has more rows than the chunk has tokens
         const int64_t Gr = pp->G;
         pp->Xq_g = take(mmq::q8_bytes(Gr, N));
         pp->Hq_g = take(mmq::q8_bytes(Gr, 640));
@@ -1102,7 +1121,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
         const char* fs = std::getenv("STRATA_PF_PEER_STREAM");
         pp->ps_frac = fs ? std::atof(fs) : 0.35;   // measured: 0.25-0.5 all ~1950-1970 at 32K, 0.35 best
-        if (pp->ps_frac > 0.0 && !mp.fallback && m.T_max >= stream_all_min()) {
+        if (pp->ps_frac > 0.0 && !mp.fallback && pp->T_max >= stream_all_min()) {
             pp->RP = 48;
             if (const char* pr = std::getenv("STRATA_PF_PEER_RING"); pr != nullptr) pp->RP = std::atoi(pr);
             pp->pstage.assign((size_t) pp->RP, nullptr);
@@ -1140,8 +1159,9 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
     if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
-    std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
-                         "layer%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
+    std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk of up to %lld tokens (up "
+                         "to %lld rows per layer%s); %zu MiB left free on it\n", pp->dev,
+                 (long long) pp->T_max, (long long) pp->cap_rows,
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                                     "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
                                                  : ", compact group buffers") : "", fb >> 20);
@@ -1471,7 +1491,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-        const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
+        // multi-GPU: the peer takes part in this chunk only up to its chunk size (peer_max_chunk); a bigger chunk
+        // streams every expert the primary lacks, as without a peer
+        const bool peer_chunk = m.pp && T <= m.pp->T_max;
+        const bool ps_on = stream_all && peer_chunk && m.pp->ps_frac > 0.0;
         if (m.pp && !ps_on) m.pp->ps_flag.clear();
         // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
         auto p_issue_until = [&](size_t limit) {
@@ -1515,7 +1538,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (m.pp && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (peer_chunk && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -2064,7 +2087,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                         std::vector<char> on_peer;
                         int64_t rows_local = T * K, rows_peer = 0;
-                        if (m.pp && pre_mmq) {
+                        if (peer_chunk && pre_mmq) {
                             on_peer.assign((size_t) m.g->n_expert, 0);
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
